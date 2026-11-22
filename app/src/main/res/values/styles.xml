@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="NakedTheme" parent="@android:style/Theme.NoTitleBar">
+        <item name="android:windowBackground">#121212</item>
+        <item name="android:colorBackground">#121212</item>
+    </style>
+</resources>
