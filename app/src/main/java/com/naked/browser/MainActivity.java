@@ -76,14 +76,16 @@ public class MainActivity extends Activity {
 
     // Tab Management
     public static class TabItem {
-        public final WebView webView;
+        // Null while the tab is hibernated: only metadata + savedState remain.
+        public WebView webView;
+        public Bundle savedState;
         public String title = "New Tab";
         public String currentUrl = "";
         public boolean isDesktop = false;
         public Button tabButton;
 
-        public TabItem(WebView webView) {
-            this.webView = webView;
+        public TabItem(String url) {
+            this.currentUrl = url == null ? "" : url;
         }
     }
 
@@ -252,10 +254,7 @@ public class MainActivity extends Activity {
     // =====================================================================
 
     private void createNewTab(String url) {
-        WebView wv = new WebView(this);
-        configureWebView(wv);
-
-        TabItem item = new TabItem(wv);
+        TabItem item = new TabItem(TextUtils.isEmpty(url) ? DEFAULT_HOME : url);
         tabs.add(item);
         int newIdx = tabs.size() - 1;
 
@@ -281,32 +280,30 @@ public class MainActivity extends Activity {
         item.tabButton = tabBtn;
         tabStrip.addView(tabBtn);
 
-        // Add WebView to container (hidden until switched)
-        wv.setVisibility(View.GONE);
-        webContainer.addView(wv, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-
+        // WebView is created lazily by switchTab() -> materializeTab().
         switchTab(newIdx);
-
-        if (!TextUtils.isEmpty(url)) {
-            wv.loadUrl(url);
-        }
     }
 
     private void switchTab(int index) {
         if (index < 0 || index >= tabs.size()) return;
 
-        // Hide current
-        if (activeIndex >= 0 && activeIndex < tabs.size()) {
-            TabItem old = tabs.get(activeIndex);
-            old.webView.setVisibility(View.GONE);
-            old.tabButton.setBackgroundColor(C_TAB_IDLE);
+        // Only the target tab and one adjacent tab keep a live WebView.
+        int neighbor = neighborOf(index);
+        for (int i = 0; i < tabs.size(); i++) {
+            TabItem it = tabs.get(i);
+            if (i == index) continue;
+            if (it.tabButton != null) it.tabButton.setBackgroundColor(C_TAB_IDLE);
+            if (i != neighbor && it.webView != null) hibernateTab(it);
         }
 
         activeIndex = index;
+        progressBar.setVisibility(View.GONE);
+        progressBar.setProgress(0);
         TabItem current = tabs.get(index);
+        if (current.tabButton != null) current.tabButton.setBackgroundColor(C_TAB_ACTIVE);
+
+        materializeTab(current);
         current.webView.setVisibility(View.VISIBLE);
-        current.tabButton.setBackgroundColor(C_TAB_ACTIVE);
 
         // Sync URL and desktop status
         urlInput.setText(current.currentUrl.isEmpty() ? current.webView.getUrl() : current.currentUrl);
@@ -317,26 +314,42 @@ public class MainActivity extends Activity {
 
     private void closeTab(int index) {
         if (index < 0 || index >= tabs.size()) return;
-        TabItem item = tabs.get(index);
 
-        if (!TextUtils.isEmpty(item.currentUrl)) {
-            closedTabsHistory.push(item.currentUrl);
+        int target;
+        if (activeIndex == index) {
+            target = -1;
+        } else if (activeIndex > index) {
+            target = activeIndex - 1;
+        } else {
+            target = activeIndex;
         }
 
-        // Clean WebView
-        webContainer.removeView(item.webView);
-        item.webView.stopLoading();
-        item.webView.destroy();
-
-        tabStrip.removeView(item.tabButton);
-        tabs.remove(index);
+        removeTabAt(index, true);
 
         if (tabs.isEmpty()) {
             createNewTab(DEFAULT_HOME);
+        } else if (target < 0) {
+            switchTab(Math.max(0, Math.min(index, tabs.size() - 1)));
         } else {
-            int next = Math.max(0, index - 1);
-            switchTab(next);
+            switchTab(target);
         }
+    }
+
+    private void removeTabAt(int index, boolean remember) {
+        TabItem item = tabs.get(index);
+        if (remember && !TextUtils.isEmpty(item.currentUrl)) {
+            closedTabsHistory.push(item.currentUrl);
+        }
+        WebView wv = item.webView;
+        if (wv != null) {
+            webContainer.removeView(wv);
+            wv.stopLoading();
+            wv.destroy();
+            item.webView = null;
+        }
+        item.savedState = null;
+        tabStrip.removeView(item.tabButton);
+        tabs.remove(index);
     }
 
     private void restoreLastClosedTab() {
@@ -362,8 +375,9 @@ public class MainActivity extends Activity {
                     } else if (which == 2) {
                         TabItem target = tabs.get(index);
                         for (int i = tabs.size() - 1; i >= 0; i--) {
-                            if (tabs.get(i) != target) closeTab(i);
+                            if (tabs.get(i) != target) removeTabAt(i, true);
                         }
+                        switchTab(tabs.indexOf(target));
                     }
                 })
                 .show();
@@ -432,7 +446,7 @@ public class MainActivity extends Activity {
             @Override
             public void onProgressChanged(WebView view, int newProgress) {
                 int idx = findTabByWebView(view);
-                if (idx == activeIndex) {
+                if (idx != -1 && idx == activeIndex) {
                     progressBar.setProgress(newProgress);
                     if (newProgress >= 100) {
                         progressBar.setVisibility(View.GONE);
@@ -477,9 +491,63 @@ public class MainActivity extends Activity {
 
     private WebView getActiveWebView() {
         if (activeIndex >= 0 && activeIndex < tabs.size()) {
-            return tabs.get(activeIndex).webView;
+            TabItem item = tabs.get(activeIndex);
+            if (item.webView == null) {
+                materializeTab(item);
+                item.webView.setVisibility(View.VISIBLE);
+            }
+            return item.webView;
         }
         return null;
+    }
+
+    // =====================================================================
+    //  WebView lifecycle — only the active tab and one neighbour stay alive
+    // =====================================================================
+
+    private int neighborOf(int index) {
+        if (index + 1 < tabs.size()) return index + 1;
+        if (index - 1 >= 0) return index - 1;
+        return -1;
+    }
+
+    private void hibernateTab(TabItem item) {
+        WebView wv = item.webView;
+        if (wv == null) return;
+
+        if (!TextUtils.isEmpty(wv.getUrl())) item.currentUrl = wv.getUrl();
+        if (!TextUtils.isEmpty(wv.getTitle())) item.title = wv.getTitle();
+
+        Bundle state = new Bundle();
+        item.savedState = wv.saveState(state) == null ? null : state;
+
+        wv.stopLoading();
+        webContainer.removeView(wv);
+        wv.destroy();
+        item.webView = null;
+    }
+
+    private void materializeTab(TabItem item) {
+        if (item.webView != null) return;
+
+        WebView wv = new WebView(this);
+        configureWebView(wv);
+        if (item.isDesktop) wv.getSettings().setUserAgentString(DESKTOP_UA);
+        wv.setVisibility(View.GONE);
+        webContainer.addView(wv, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        item.webView = wv;
+
+        if (item.savedState != null) {
+            wv.restoreState(item.savedState);
+            item.savedState = null;
+            // restoreState restores history but not display data. Reload the
+            // current entry instead of loadUrl to avoid a duplicate entry.
+            wv.reload();
+        } else {
+            String url = TextUtils.isEmpty(item.currentUrl) ? DEFAULT_HOME : item.currentUrl;
+            wv.loadUrl(url);
+        }
     }
 
     // =====================================================================
@@ -506,11 +574,13 @@ public class MainActivity extends Activity {
 
     private void toggleDesktopMode() {
         if (activeIndex < 0 || activeIndex >= tabs.size()) return;
+        WebView wv = getActiveWebView();
+        if (wv == null) return;
         TabItem item = tabs.get(activeIndex);
         item.isDesktop = !item.isDesktop;
         updateDesktopButton(item.isDesktop);
 
-        WebSettings ws = item.webView.getSettings();
+        WebSettings ws = wv.getSettings();
         if (item.isDesktop) {
             ws.setUserAgentString(DESKTOP_UA);
             toast("Desktop Mode ON");
@@ -518,7 +588,7 @@ public class MainActivity extends Activity {
             ws.setUserAgentString(null);
             toast("Desktop Mode OFF");
         }
-        item.webView.reload();
+        wv.reload();
     }
 
     private void updateDesktopButton(boolean isDesktop) {
@@ -576,8 +646,12 @@ public class MainActivity extends Activity {
 
     private void clearBrowserData(boolean showToast) {
         for (TabItem it : tabs) {
-            it.webView.clearCache(true);
-            it.webView.clearHistory();
+            if (it.webView != null) {
+                it.webView.clearCache(true);
+                it.webView.clearHistory();
+            }
+            // Dropping saved state also drops the history of a hibernated tab.
+            it.savedState = null;
         }
         CookieManager.getInstance().removeAllCookies(null);
         CookieManager.getInstance().flush();
@@ -615,10 +689,34 @@ public class MainActivity extends Activity {
     }
 
     @Override
+    public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        if (level >= TRIM_MEMORY_UI_HIDDEN) hibernateInactiveTabs();
+    }
+
+    @Override
+    public void onLowMemory() {
+        super.onLowMemory();
+        hibernateInactiveTabs();
+    }
+
+    private void hibernateInactiveTabs() {
+        for (int i = 0; i < tabs.size(); i++) {
+            if (i != activeIndex) hibernateTab(tabs.get(i));
+        }
+    }
+
+    @Override
     protected void onDestroy() {
         for (TabItem it : tabs) {
-            it.webView.stopLoading();
-            it.webView.destroy();
+            WebView wv = it.webView;
+            if (wv != null) {
+                webContainer.removeView(wv);
+                wv.stopLoading();
+                wv.destroy();
+                it.webView = null;
+            }
+            it.savedState = null;
         }
         tabs.clear();
         super.onDestroy();
