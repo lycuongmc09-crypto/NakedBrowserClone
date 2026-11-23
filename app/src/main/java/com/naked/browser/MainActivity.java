@@ -6,12 +6,14 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Bitmap;
+import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.text.TextUtils;
+import android.util.Log;
 import android.util.Patterns;
 import android.view.Gravity;
 import android.view.KeyEvent;
@@ -23,6 +25,8 @@ import android.webkit.CookieManager;
 import android.webkit.DownloadListener;
 import android.webkit.URLUtil;
 import android.webkit.WebChromeClient;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
@@ -30,11 +34,13 @@ import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.HorizontalScrollView;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ProgressBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import java.io.ByteArrayInputStream;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
@@ -64,6 +70,15 @@ public class MainActivity extends Activity {
     // Desktop User Agent
     private static final String DESKTOP_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
+    // Sub-resource tracker hosts (suffix-anchored, never substring matched).
+    private static final String[] BLOCKED_HOSTS = {
+            "doubleclick.net", "google-analytics.com", "googletagmanager.com",
+            "scorecardresearch.com", "quantserve.com", "facebook.net"
+    };
+    private static final String PERF_TAG = "NakedPerf";
+    private static final java.util.concurrent.atomic.AtomicInteger blockedRequests =
+            new java.util.concurrent.atomic.AtomicInteger();
+
     // View Components
     private FrameLayout rootContainer;
     private LinearLayout topBar;
@@ -72,6 +87,7 @@ public class MainActivity extends Activity {
     private EditText urlInput;
     private ProgressBar progressBar;
     private FrameLayout webContainer;
+    private ImageView snapshotView;
     private Button btnDesktop;
 
     // Tab Management
@@ -79,6 +95,8 @@ public class MainActivity extends Activity {
         // Null while the tab is hibernated: only metadata + savedState remain.
         public WebView webView;
         public Bundle savedState;
+        public Bitmap snapshot;
+        public long loadStartNs;
         public String title = "New Tab";
         public String currentUrl = "";
         public boolean isDesktop = false;
@@ -229,6 +247,13 @@ public class MainActivity extends Activity {
         mainLayout.addView(webContainer, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
+        // Overlay shown while a hibernated tab reloads behind it.
+        snapshotView = new ImageView(this);
+        snapshotView.setScaleType(ImageView.ScaleType.FIT_XY);
+        snapshotView.setVisibility(View.GONE);
+        webContainer.addView(snapshotView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
         rootContainer = new FrameLayout(this);
         rootContainer.addView(mainLayout);
         setContentView(rootContainer);
@@ -289,6 +314,10 @@ public class MainActivity extends Activity {
     private void switchTab(int index) {
         if (index < 0 || index >= tabs.size()) return;
 
+        // Clear the overlay before any snapshot can be recycled by hibernation.
+        snapshotView.setVisibility(View.GONE);
+        snapshotView.setImageBitmap(null);
+
         // Only the target tab and, normally, one adjacent tab keep a live WebView.
         // Under memory pressure no neighbour is kept warm.
         int neighbor = lowMemory ? -1 : neighborOf(index);
@@ -297,9 +326,15 @@ public class MainActivity extends Activity {
             if (i == index) continue;
             if (it.tabButton != null) it.tabButton.setBackgroundColor(C_TAB_IDLE);
             if (it.webView != null) {
-                // A live neighbour must not keep drawing a full-screen frame.
-                it.webView.setVisibility(View.GONE);
-                if (i != neighbor) hibernateTab(it);
+                if (i != neighbor) {
+                    // Capture while the outgoing tab is still visible.
+                    hibernateTab(it);
+                } else {
+                    // Capture while it is still visible, before hiding it.
+                    captureSnapshot(it, it.webView);
+                    // A live neighbour must not keep drawing a full-screen frame.
+                    it.webView.setVisibility(View.GONE);
+                }
             }
         }
 
@@ -310,6 +345,9 @@ public class MainActivity extends Activity {
         if (current.tabButton != null) current.tabButton.setBackgroundColor(C_TAB_ACTIVE);
 
         materializeTab(current);
+        if (current.snapshot != null) {
+            showSnapshot(current.snapshot);
+        }
         current.webView.setVisibility(View.VISIBLE);
 
         // Sync URL and desktop status
@@ -355,6 +393,11 @@ public class MainActivity extends Activity {
             item.webView = null;
         }
         item.savedState = null;
+        if (index == activeIndex) {
+            snapshotView.setVisibility(View.GONE);
+            snapshotView.setImageBitmap(null);
+        }
+        releaseSnapshot(item);
         tabStrip.removeView(item.tabButton);
         tabs.remove(index);
     }
@@ -390,6 +433,23 @@ public class MainActivity extends Activity {
                 .show();
     }
 
+    private boolean handleExternalUrl(String url) {
+        if (url.startsWith("http://") || url.startsWith("https://")) return false;
+        try {
+            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
+        } catch (Exception ignored) {}
+        return true;
+    }
+
+    private static boolean isBlocked(String host) {
+        if (TextUtils.isEmpty(host)) return false;
+        String h = host.toLowerCase(java.util.Locale.ROOT);
+        for (String b : BLOCKED_HOSTS) {
+            if (h.equals(b) || h.endsWith("." + b)) return true;
+        }
+        return false;
+    }
+
     // =====================================================================
     //  WebView Configuration
     // =====================================================================
@@ -412,14 +472,31 @@ public class MainActivity extends Activity {
         wv.setWebViewClient(new WebViewClient() {
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, String url) {
-                if (url.startsWith("http://") || url.startsWith("https://")) {
+                return handleExternalUrl(url);
+            }
+
+            @Override
+            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                try {
+                    return handleExternalUrl(request.getUrl().toString());
+                } catch (Throwable ignored) {
                     return false;
                 }
-                // External protocol handling (tel, mailto, etc.)
+            }
+
+            @Override
+            public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
                 try {
-                    startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
-                } catch (Exception ignored) {}
-                return true;
+                    if (!request.isForMainFrame() && isBlocked(request.getUrl().getHost())) {
+                        int blocked = blockedRequests.incrementAndGet();
+                        Log.d(PERF_TAG, "blocked=" + blocked + " " + request.getUrl());
+                        return new WebResourceResponse("text/plain", "UTF-8",
+                                new ByteArrayInputStream(new byte[0]));
+                    }
+                } catch (Throwable ignored) {
+                    // Fail open: the blocker must never break navigation.
+                }
+                return super.shouldInterceptRequest(view, request);
             }
 
             @Override
@@ -439,6 +516,7 @@ public class MainActivity extends Activity {
                 int idx = findTabByWebView(view);
                 if (idx != -1) {
                     tabs.get(idx).currentUrl = url;
+                    hideSnapshot(view);
                     if (idx == activeIndex) {
                         progressBar.setVisibility(View.GONE);
                     }
@@ -454,6 +532,7 @@ public class MainActivity extends Activity {
                     progressBar.setProgress(newProgress);
                     if (newProgress >= 100) {
                         progressBar.setVisibility(View.GONE);
+                        hideSnapshot(view);
                     } else {
                         progressBar.setVisibility(View.VISIBLE);
                     }
@@ -522,6 +601,8 @@ public class MainActivity extends Activity {
         if (!TextUtils.isEmpty(wv.getUrl())) item.currentUrl = wv.getUrl();
         if (!TextUtils.isEmpty(wv.getTitle())) item.title = wv.getTitle();
 
+        captureSnapshot(item, wv);
+
         Bundle state = new Bundle();
         item.savedState = wv.saveState(state) == null ? null : state;
 
@@ -541,6 +622,8 @@ public class MainActivity extends Activity {
         webContainer.addView(wv, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         item.webView = wv;
+        showSnapshot(item.snapshot);
+        item.loadStartNs = System.nanoTime();
 
         String url = TextUtils.isEmpty(item.currentUrl) ? DEFAULT_HOME : item.currentUrl;
         if (item.savedState != null) {
@@ -555,6 +638,72 @@ public class MainActivity extends Activity {
             }
         } else {
             wv.loadUrl(url);
+        }
+    }
+
+    private void captureSnapshot(TabItem item, WebView wv) {
+        // Keep the last valid capture; a re-capture from a hidden view is blank.
+        if (item.snapshot != null && !item.snapshot.isRecycled()) return;
+        int w = wv.getWidth();
+        int h = wv.getHeight();
+        if (w <= 0 || h <= 0) return;
+
+        final float scale = 0.25f;
+        Bitmap bmp = Bitmap.createBitmap(Math.max(1, Math.round(w * scale)),
+                Math.max(1, Math.round(h * scale)), Bitmap.Config.RGB_565);
+        Canvas canvas = new Canvas(bmp);
+        canvas.scale(scale, scale);
+        try {
+            wv.draw(canvas);
+        } catch (Throwable t) {
+            bmp.recycle();
+            return;
+        }
+
+        // A hardware-composited WebView can draw nothing; drop blank snapshots.
+        int first = bmp.getPixel(0, 0);
+        boolean uniform = true;
+        for (int i = 1; i < 8 && uniform; i++) {
+            int x = Math.min(bmp.getWidth() - 1, i * bmp.getWidth() / 8);
+            int y = Math.min(bmp.getHeight() - 1, i * bmp.getHeight() / 8);
+            if (bmp.getPixel(x, y) != first) uniform = false;
+        }
+        if (uniform) {
+            bmp.recycle();
+            return;
+        }
+        item.snapshot = bmp;
+    }
+
+    private void showSnapshot(Bitmap bitmap) {
+        if (bitmap == null || bitmap.isRecycled()) return;
+        snapshotView.setImageBitmap(bitmap);
+        snapshotView.bringToFront();
+        snapshotView.setVisibility(View.VISIBLE);
+    }
+
+    private void hideSnapshot(WebView wv) {
+        int idx = findTabByWebView(wv);
+        if (idx < 0 || idx >= tabs.size()) return;
+        TabItem item = tabs.get(idx);
+        if (item.loadStartNs != 0) {
+            Log.d(PERF_TAG, "load ms=" + (System.nanoTime() - item.loadStartNs) / 1000000L
+                    + " url=" + item.currentUrl);
+            item.loadStartNs = 0;
+        }
+        if (item.snapshot == null) return;
+        if (idx == activeIndex) {
+            snapshotView.setVisibility(View.GONE);
+            snapshotView.setImageBitmap(null);
+        }
+        item.snapshot.recycle();
+        item.snapshot = null;
+    }
+
+    private void releaseSnapshot(TabItem item) {
+        if (item.snapshot != null) {
+            item.snapshot.recycle();
+            item.snapshot = null;
         }
     }
 
@@ -660,7 +809,10 @@ public class MainActivity extends Activity {
             }
             // Dropping saved state also drops the history of a hibernated tab.
             it.savedState = null;
+            releaseSnapshot(it);
         }
+        snapshotView.setVisibility(View.GONE);
+        snapshotView.setImageBitmap(null);
         CookieManager.getInstance().removeAllCookies(null);
         CookieManager.getInstance().flush();
         if (showToast) toast("Cache & Cookies cleared");
@@ -746,7 +898,10 @@ public class MainActivity extends Activity {
                 it.webView = null;
             }
             it.savedState = null;
+            releaseSnapshot(it);
         }
+        snapshotView.setVisibility(View.GONE);
+        snapshotView.setImageBitmap(null);
         tabs.clear();
         super.onDestroy();
     }
