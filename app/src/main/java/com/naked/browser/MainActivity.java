@@ -1,6 +1,7 @@
 package com.naked.browser;
 
 import android.app.Activity;
+import android.app.ActivityManager;
 import android.app.AlertDialog;
 import android.content.Context;
 import android.content.Intent;
@@ -97,6 +98,7 @@ public class MainActivity extends Activity {
         public Bundle savedState;
         public Bitmap snapshot;
         public long loadStartNs;
+        public boolean paused;
         public String title = "New Tab";
         public String currentUrl = "";
         public boolean isDesktop = false;
@@ -112,14 +114,26 @@ public class MainActivity extends Activity {
     private final Deque<String> closedTabsHistory = new ArrayDeque<>();
     // While backgrounded under memory pressure the adjacent tab is not kept warm.
     private boolean lowMemory = false;
+    // On low-RAM devices only the active tab is kept warm by default.
+    private boolean lowRam;
 
     // Bookmarks Preference
     private SharedPreferences prefs;
+
+    private boolean detectLowRam() {
+        ActivityManager am = (ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
+        if (am == null) return false;
+        int memClass = am.getMemoryClass();
+        boolean low = am.isLowRamDevice() || memClass <= 32;
+        Log.d(PERF_TAG, "lowRam=" + low + " memClass=" + memClass);
+        return low;
+    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         prefs = getSharedPreferences("naked_prefs", MODE_PRIVATE);
+        lowRam = detectLowRam();
 
         buildPureUI();
 
@@ -320,7 +334,7 @@ public class MainActivity extends Activity {
 
         // Only the target tab and, normally, one adjacent tab keep a live WebView.
         // Under memory pressure no neighbour is kept warm.
-        int neighbor = lowMemory ? -1 : neighborOf(index);
+        int neighbor = (lowMemory || lowRam) ? -1 : neighborOf(index);
         for (int i = 0; i < tabs.size(); i++) {
             TabItem it = tabs.get(i);
             if (i == index) continue;
@@ -332,8 +346,13 @@ public class MainActivity extends Activity {
                 } else {
                     // Capture while it is still visible, before hiding it.
                     captureSnapshot(it, it.webView);
-                    // A live neighbour must not keep drawing a full-screen frame.
+                    // A live neighbour must not keep drawing a full-screen frame,
+                    // and must not keep running JS timers/animations either.
                     it.webView.setVisibility(View.GONE);
+                    if (!it.paused) {
+                        it.webView.onPause();
+                        it.paused = true;
+                    }
                 }
             }
         }
@@ -345,6 +364,10 @@ public class MainActivity extends Activity {
         if (current.tabButton != null) current.tabButton.setBackgroundColor(C_TAB_ACTIVE);
 
         materializeTab(current);
+        if (current.paused) {
+            current.webView.onResume();
+            current.paused = false;
+        }
         if (current.snapshot != null) {
             showSnapshot(current.snapshot);
         }
@@ -610,6 +633,7 @@ public class MainActivity extends Activity {
         webContainer.removeView(wv);
         wv.destroy();
         item.webView = null;
+        item.paused = false;
     }
 
     private void materializeTab(TabItem item) {
@@ -622,6 +646,7 @@ public class MainActivity extends Activity {
         webContainer.addView(wv, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         item.webView = wv;
+        item.paused = false;
         showSnapshot(item.snapshot);
         item.loadStartNs = System.nanoTime();
 
@@ -851,7 +876,10 @@ public class MainActivity extends Activity {
     @Override
     protected void onPause() {
         for (TabItem it : tabs) {
-            if (it.webView != null) it.webView.onPause();
+            if (it.webView != null && !it.paused) {
+                it.webView.onPause();
+                it.paused = true;
+            }
         }
         super.onPause();
     }
@@ -860,8 +888,13 @@ public class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         lowMemory = false;
-        for (TabItem it : tabs) {
-            if (it.webView != null) it.webView.onResume();
+        // Keep a hidden neighbour paused; only the active tab resumes.
+        for (int i = 0; i < tabs.size(); i++) {
+            TabItem it = tabs.get(i);
+            if (i == activeIndex && it.webView != null && it.paused) {
+                it.webView.onResume();
+                it.paused = false;
+            }
         }
     }
 
