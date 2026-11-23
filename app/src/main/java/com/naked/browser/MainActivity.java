@@ -92,6 +92,8 @@ public class MainActivity extends Activity {
     private final List<TabItem> tabs = new ArrayList<>();
     private int activeIndex = -1;
     private final Deque<String> closedTabsHistory = new ArrayDeque<>();
+    // While backgrounded under memory pressure the adjacent tab is not kept warm.
+    private boolean lowMemory = false;
 
     // Bookmarks Preference
     private SharedPreferences prefs;
@@ -287,13 +289,18 @@ public class MainActivity extends Activity {
     private void switchTab(int index) {
         if (index < 0 || index >= tabs.size()) return;
 
-        // Only the target tab and one adjacent tab keep a live WebView.
-        int neighbor = neighborOf(index);
+        // Only the target tab and, normally, one adjacent tab keep a live WebView.
+        // Under memory pressure no neighbour is kept warm.
+        int neighbor = lowMemory ? -1 : neighborOf(index);
         for (int i = 0; i < tabs.size(); i++) {
             TabItem it = tabs.get(i);
             if (i == index) continue;
             if (it.tabButton != null) it.tabButton.setBackgroundColor(C_TAB_IDLE);
-            if (i != neighbor && it.webView != null) hibernateTab(it);
+            if (it.webView != null) {
+                // A live neighbour must not keep drawing a full-screen frame.
+                it.webView.setVisibility(View.GONE);
+                if (i != neighbor) hibernateTab(it);
+            }
         }
 
         activeIndex = index;
@@ -401,9 +408,6 @@ public class MainActivity extends Activity {
         ws.setAllowFileAccess(false); // Security
         ws.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
         ws.setCacheMode(WebSettings.LOAD_DEFAULT);
-
-        // Hardware accelerated layer
-        wv.setLayerType(View.LAYER_TYPE_HARDWARE, null);
 
         wv.setWebViewClient(new WebViewClient() {
             @Override
@@ -538,14 +542,18 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         item.webView = wv;
 
+        String url = TextUtils.isEmpty(item.currentUrl) ? DEFAULT_HOME : item.currentUrl;
         if (item.savedState != null) {
-            wv.restoreState(item.savedState);
+            boolean restored = wv.restoreState(item.savedState) != null;
             item.savedState = null;
-            // restoreState restores history but not display data. Reload the
-            // current entry instead of loadUrl to avoid a duplicate entry.
-            wv.reload();
+            if (restored) {
+                // restoreState restores history but not display data. Reload the
+                // current entry instead of loadUrl to avoid a duplicate entry.
+                wv.reload();
+            } else {
+                wv.loadUrl(url);
+            }
         } else {
-            String url = TextUtils.isEmpty(item.currentUrl) ? DEFAULT_HOME : item.currentUrl;
             wv.loadUrl(url);
         }
     }
@@ -689,14 +697,35 @@ public class MainActivity extends Activity {
     }
 
     @Override
+    protected void onPause() {
+        for (TabItem it : tabs) {
+            if (it.webView != null) it.webView.onPause();
+        }
+        super.onPause();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        lowMemory = false;
+        for (TabItem it : tabs) {
+            if (it.webView != null) it.webView.onResume();
+        }
+    }
+
+    @Override
     public void onTrimMemory(int level) {
         super.onTrimMemory(level);
-        if (level >= TRIM_MEMORY_UI_HIDDEN) hibernateInactiveTabs();
+        if (level >= TRIM_MEMORY_RUNNING_LOW) hibernateInactiveTabs();
+        // Only a background-level trim disables neighbour warming; a transient
+        // foreground trim must not stick for the rest of the session.
+        if (level >= TRIM_MEMORY_UI_HIDDEN) lowMemory = true;
     }
 
     @Override
     public void onLowMemory() {
         super.onLowMemory();
+        lowMemory = true;
         hibernateInactiveTabs();
     }
 
